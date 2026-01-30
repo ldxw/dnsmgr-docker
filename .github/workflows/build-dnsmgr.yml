@@ -2,6 +2,12 @@ name: 构建并发布 dnsmgr 镜像（每日检测上游 Release + 离线 tar + 
 
 on:
   workflow_dispatch:
+    inputs:
+      force_rebuild:
+        type: boolean
+        description: "强制重构（忽略版本记录，重新构建并覆盖 Release 附件）"
+        required: false
+        default: false
   schedule:
     # 每天北京时间 00:10 触发（UTC=16:10）
     - cron: "10 16 * * *"
@@ -49,19 +55,32 @@ jobs:
           echo "current=${CUR}" >> "$GITHUB_OUTPUT"
           echo "当前记录版本: ${CUR}"
 
-      - name: 判断是否需要构建
+      - name: 判断是否需要构建（手动可选强制；定时按版本变化）
         id: need
         run: |
           set -e
-          if [ "${{ steps.upstream.outputs.version }}" = "${{ steps.local.outputs.current }}" ]; then
-            echo "build=no" >> "$GITHUB_OUTPUT"
-            echo "无需构建：版本未变化"
-          else
+          EVENT="${{ github.event_name }}"
+          FORCE="${{ github.event.inputs.force_rebuild }}"
+          echo "event_name=${EVENT}"
+          echo "force_rebuild=${FORCE}"
+
+          # 手动触发且选择强制重构
+          if [ "${EVENT}" = "workflow_dispatch" ] && [ "${FORCE}" = "true" ]; then
             echo "build=yes" >> "$GITHUB_OUTPUT"
-            echo "需要构建：发现新版本 ${{ steps.upstream.outputs.version }}"
+            echo "手动触发：强制重构"
+            exit 0
           fi
 
-      - name: 更新版本记录文件并提交（仅当有新版本）
+          # 否则（定时或手动但未勾选强制）：按版本变化判断
+          if [ "${{ steps.upstream.outputs.version }}" = "${{ steps.local.outputs.current }}" ]; then
+            echo "build=no" >> "$GITHUB_OUTPUT"
+            echo "版本未变化，跳过"
+          else
+            echo "build=yes" >> "$GITHUB_OUTPUT"
+            echo "发现新版本 ${{ steps.upstream.outputs.version }}"
+          fi
+
+      - name: 更新版本记录文件并提交（仅当本次执行构建）
         if: steps.need.outputs.build == 'yes'
         run: |
           set -e
@@ -122,7 +141,7 @@ jobs:
           ls -lh dist
 
       # =========================
-      # Release：不存在就创建；说明仅上游链接/镜像标签/导入命令
+      # Release：说明仅上游链接/镜像标签/导入命令；附件冲突则先删后传
       # =========================
       - name: 生成 Release 说明内容（精简版）
         if: steps.need.outputs.build == 'yes'
