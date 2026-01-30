@@ -58,13 +58,16 @@ COPY config/supervisord.conf /etc/supervisor/conf.d/supervisord.conf
 # Add application (from GitHub Releases zip)
 # 例如: https://github.com/netcccyun/dnsmgr/releases/download/2.15/dnsmgr_2.15.zip
 ARG DNSMGR_VERSION
-RUN test -n "$DNSMGR_VERSION" \
-  && mkdir -p /app \
-  && wget "https://github.com/netcccyun/dnsmgr/releases/download/${DNSMGR_VERSION}/dnsmgr_${DNSMGR_VERSION}.zip" -O /tmp/www.zip \
-  && unzip /tmp/www.zip -d /tmp/ \
-  && rm -rf /app/www \
-  && mv "/tmp/dnsmgr_${DNSMGR_VERSION}" /app/www \
-  && rm -f /tmp/www.zip
+RUN set -eux; \
+  test -n "${DNSMGR_VERSION}"; \
+  mkdir -p /tmp/dnsmgr_unpack; \
+  wget -O /tmp/www.zip "https://github.com/netcccyun/dnsmgr/releases/download/${DNSMGR_VERSION}/dnsmgr_${DNSMGR_VERSION}.zip"; \
+  unzip -q /tmp/www.zip -d /tmp/dnsmgr_unpack; \
+  rm -f /tmp/www.zip; \
+  rm -rf /app/www; \
+  mkdir -p /app/www; \
+  cp -a /tmp/dnsmgr_unpack/. /app/www; \
+  rm -rf /tmp/dnsmgr_unpack
 
 # Install composer
 RUN wget https://mirrors.aliyun.com/composer/composer.phar -O /usr/local/bin/composer && chmod +x /usr/local/bin/composer
