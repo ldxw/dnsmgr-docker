@@ -248,6 +248,6 @@ jobs:
             DNSMGR_VERSION=${{ steps.upstream.outputs.version }}
           tags: |
             ${{ env.DOCKERHUB_IMAGE }}:latest
-            ${{ env.DOCKERHUB_IMAGE }}:${{ steps.upstream.outputs.version }}
+            ${{ env.DOCKERHUB_IMAGE }}:v${{ steps.upstream.outputs.version }}
             ${{ env.GHCR_IMAGE }}:latest
-            ${{ env.GHCR_IMAGE }}:${{ steps.upstream.outputs.version }}
+            ${{ env.GHCR_IMAGE }}:v${{ steps.upstream.outputs.version }}
