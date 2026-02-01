@@ -37,11 +37,11 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -e
-          TAG="$(gh api repos/${UPSTREAM_REPO}/releases/latest --jq .tag_name)"  # e.g. v2.15
-          VER="${TAG#v}"  # e.g. 2.15
+          TAG="$(gh api repos/${UPSTREAM_REPO}/releases/latest --jq .tag_name)"  # 可能是 2.15 或 v2.15
+          VER="${TAG#v}"  # 去掉前缀 v（如果没有 v 也不影响）
           echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
           echo "version=${VER}" >> "$GITHUB_OUTPUT"
-          echo "上游最新 Release: ${TAG} -> ${VER}"
+          echo "上游最新 tag: ${TAG}, 版本号: ${VER}"
 
       - name: 读取本仓库已构建的版本号（用于对比）
         id: local
@@ -115,7 +115,7 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
 
       # =========================
-      # B 方案：分别导出 amd64/arm64 tar 离线包
+      # 分别导出 amd64/arm64 tar 离线包
       # =========================
       - name: 生成离线 tar 包（amd64 + arm64）
         if: steps.need.outputs.build == 'yes'
@@ -149,8 +149,8 @@ jobs:
         run: |
           set -e
           VER="${{ steps.upstream.outputs.version }}"
-          TAG="v${VER}"
-          UPSTREAM_URL="https://github.com/${{ env.UPSTREAM_REPO }}/releases/tag/${TAG}"
+          # 上游这里确认是 /releases/tag/2.15 这种（不带 v）
+          UPSTREAM_URL="https://github.com/${{ env.UPSTREAM_REPO }}/releases/tag/${VER}"
 
           cat > release_notes.md <<EOF
           ## 上游 Release
@@ -159,11 +159,11 @@ jobs:
           ## 镜像标签
           **Docker Hub**
           - \`${{ env.DOCKERHUB_IMAGE }}:latest\`
-          - \`${{ env.DOCKERHUB_IMAGE }}:${VER}\`
+          - \`${{ env.DOCKERHUB_IMAGE }}:v${VER}\`
 
           **GHCR**
           - \`${{ env.GHCR_IMAGE }}:latest\`
-          - \`${{ env.GHCR_IMAGE }}:${VER}\`
+          - \`${{ env.GHCR_IMAGE }}:v${VER}\`
 
           ## 离线包导入
           **amd64（x86_64）**
