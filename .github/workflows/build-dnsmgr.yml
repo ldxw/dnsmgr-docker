@@ -1,0 +1,386 @@
+name: 构建并发布 dnsmgr 镜像（每日检测上游 Release + 离线 tar + Release 附件）
+
+on:
+  workflow_dispatch:
+    inputs:
+      force_rebuild:
+        type: boolean
+        description: "强制重构最新版（忽略版本记录，重新构建并覆盖 Release 附件）"
+        required: false
+        default: false
+
+      build_version:
+        type: string
+        description: "指定构建版本号（旧版/任意版本）。例如：2.13 或 v2.13；留空=构建上游最新"
+        required: false
+        default: ""
+
+      force_rebuild_version:
+        type: boolean
+        description: "强制重构指定版本（仅在 build_version 非空时生效）：删除同名 Release 附件后重新构建上传"
+        required: false
+        default: false
+
+  schedule:
+    # 每天北京时间 00:10 触发（UTC=16:10）
+    - cron: "10 16 * * *"
+
+permissions:
+  contents: write
+  packages: write
+  actions: read
+
+env:
+  UPSTREAM_REPO: netcccyun/dnsmgr
+  DOCKERHUB_IMAGE: ldxw/dnsmgr
+  GHCR_IMAGE: ghcr.io/${{ github.repository_owner }}/dnsmgr
+  VERSION_FILE: .github/dnsmgr-version
+
+jobs:
+  check-and-build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: 拉取当前仓库代码
+        uses: actions/checkout@v4
+
+      - name: 获取上游最新 Release 版本号（或手动指定版本）
+        id: upstream
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -e
+
+          INPUT_VER="${{ github.event.inputs.build_version }}"
+          if [ -n "${INPUT_VER}" ]; then
+            TAG="${INPUT_VER}"
+            VER="${TAG#v}"
+            echo "使用手动指定版本：${TAG} -> ${VER}"
+          else
+            TAG="$(gh api repos/${UPSTREAM_REPO}/releases/latest --jq .tag_name)"  # 可能是 2.15 或 v2.15
+            VER="${TAG#v}"  # 去掉前缀 v（如果没有 v 也不影响）
+            echo "使用上游最新版本：${TAG} -> ${VER}"
+          fi
+
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+          echo "version=${VER}" >> "$GITHUB_OUTPUT"
+
+      - name: 读取本仓库已构建的版本号（用于对比，仅最新版模式需要）
+        id: local
+        run: |
+          set -e
+          if [ -f "${VERSION_FILE}" ]; then
+            CUR="$(cat "${VERSION_FILE}" | tr -d ' \n\r\t')"
+          else
+            CUR=""
+          fi
+          echo "current=${CUR}" >> "$GITHUB_OUTPUT"
+          echo "当前记录版本: ${CUR}"
+
+      - name: 判断是否需要构建（支持：最新版检测 / 手动旧版 / 强制）
+        id: need
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -e
+
+          EVENT="${{ github.event_name }}"
+          FORCE_LATEST="${{ github.event.inputs.force_rebuild }}"
+          INPUT_VER="${{ github.event.inputs.build_version }}"
+          FORCE_VER="${{ github.event.inputs.force_rebuild_version }}"
+
+          VER="${{ steps.upstream.outputs.version }}"
+          TAG="v${VER}"
+
+          echo "event_name=${EVENT}"
+          echo "force_rebuild(latest)=${FORCE_LATEST}"
+          echo "build_version=${INPUT_VER}"
+          echo "force_rebuild_version=${FORCE_VER}"
+          echo "resolved_version=${VER}"
+          echo "resolved_tag=${TAG}"
+
+          # 默认输出（避免后面引用为空）
+          echo "build=no" >> "$GITHUB_OUTPUT"
+          echo "mode=latest" >> "$GITHUB_OUTPUT"
+          echo "push_latest=yes" >> "$GITHUB_OUTPUT"
+          echo "release_make_latest=yes" >> "$GITHUB_OUTPUT"
+          echo "update_version_file=yes" >> "$GITHUB_OUTPUT"
+          echo "rebuild=no" >> "$GITHUB_OUTPUT"
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+
+          # ---------- 模式：手动指定版本（旧版/任意版本） ----------
+          if [ "${EVENT}" = "workflow_dispatch" ] && [ -n "${INPUT_VER}" ]; then
+            echo "mode=manual_version" >> "$GITHUB_OUTPUT"
+            echo "push_latest=no" >> "$GITHUB_OUTPUT"
+            echo "release_make_latest=no" >> "$GITHUB_OUTPUT"
+            echo "update_version_file=no" >> "$GITHUB_OUTPUT"
+
+            # 强制重构指定版本：一定构建 + 一定替换 Release 附件
+            if [ "${FORCE_VER}" = "true" ]; then
+              echo "build=yes" >> "$GITHUB_OUTPUT"
+              echo "rebuild=yes" >> "$GITHUB_OUTPUT"
+              echo "手动指定版本：强制重构 ${VER}"
+              exit 0
+            fi
+
+            # 不强制：若 Release 已存在且两个附件都存在，则跳过；否则构建
+            ASSET1="dnsmgr_${VER}_amd64.tar"
+            ASSET2="dnsmgr_${VER}_arm64.tar"
+
+            if gh release view "${TAG}" >/dev/null 2>&1; then
+              RID="$(gh api repos/${{ github.repository }}/releases/tags/${TAG} --jq .id)"
+              A1="$(gh api repos/${{ github.repository }}/releases/${RID}/assets --jq ".[] | select(.name==\"${ASSET1}\") | .id" || true)"
+              A2="$(gh api repos/${{ github.repository }}/releases/${RID}/assets --jq ".[] | select(.name==\"${ASSET2}\") | .id" || true)"
+              if [ -n "${A1}" ] && [ -n "${A2}" ]; then
+                echo "build=no" >> "$GITHUB_OUTPUT"
+                echo "rebuild=no" >> "$GITHUB_OUTPUT"
+                echo "指定版本 ${VER} 的 Release 与附件已存在，跳过（如需重构请勾 force_rebuild_version）"
+                exit 0
+              fi
+            fi
+
+            echo "build=yes" >> "$GITHUB_OUTPUT"
+            echo "rebuild=no" >> "$GITHUB_OUTPUT"
+            echo "指定版本 ${VER} 未发现完整附件，开始构建"
+            exit 0
+          fi
+
+          # ---------- 模式：最新版构建（定时 / 手动不指定版本） ----------
+          echo "mode=latest" >> "$GITHUB_OUTPUT"
+          echo "push_latest=yes" >> "$GITHUB_OUTPUT"
+          echo "release_make_latest=yes" >> "$GITHUB_OUTPUT"
+          echo "update_version_file=yes" >> "$GITHUB_OUTPUT"
+
+          # 手动触发且选择强制重构（最新版）
+          if [ "${EVENT}" = "workflow_dispatch" ] && [ "${FORCE_LATEST}" = "true" ]; then
+            echo "build=yes" >> "$GITHUB_OUTPUT"
+            echo "rebuild=yes" >> "$GITHUB_OUTPUT"
+            echo "手动触发：强制重构最新版 ${VER}"
+            exit 0
+          fi
+
+          # 定时/手动（未强制）：按版本变化判断
+          if [ "${{ steps.upstream.outputs.version }}" = "${{ steps.local.outputs.current }}" ]; then
+            echo "build=no" >> "$GITHUB_OUTPUT"
+            echo "rebuild=no" >> "$GITHUB_OUTPUT"
+            echo "版本未变化，跳过"
+          else
+            echo "build=yes" >> "$GITHUB_OUTPUT"
+            echo "rebuild=no" >> "$GITHUB_OUTPUT"
+            echo "发现新版本 ${VER}"
+          fi
+
+      - name: 更新版本记录文件并提交（仅最新版构建）
+        if: steps.need.outputs.build == 'yes' && steps.need.outputs.update_version_file == 'yes'
+        run: |
+          set -e
+          echo "${{ steps.upstream.outputs.version }}" > "${VERSION_FILE}"
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add "${VERSION_FILE}"
+          git commit -m "chore: bump dnsmgr version to ${{ steps.upstream.outputs.version }}" || true
+          git push
+
+      - name: 设置 QEMU（arm64 构建需要）
+        if: steps.need.outputs.build == 'yes'
+        uses: docker/setup-qemu-action@v3
+
+      - name: 设置 Buildx
+        if: steps.need.outputs.build == 'yes'
+        uses: docker/setup-buildx-action@v3
+
+      - name: 登录 Docker Hub
+        if: steps.need.outputs.build == 'yes'
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: 登录 GHCR
+        if: steps.need.outputs.build == 'yes'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # =========================
+      # 分别导出 amd64/arm64 tar 离线包
+      # =========================
+      - name: 生成离线 tar 包（amd64 + arm64）
+        if: steps.need.outputs.build == 'yes'
+        run: |
+          set -e
+          VER="${{ steps.upstream.outputs.version }}"
+          mkdir -p dist
+
+          docker buildx build \
+            --platform linux/amd64 \
+            -t ${{ env.DOCKERHUB_IMAGE }}:${VER}-amd64 \
+            --build-arg DNSMGR_VERSION=${VER} \
+            --output type=docker,dest=dist/dnsmgr_${VER}_amd64.tar \
+            .
+
+          docker buildx build \
+            --platform linux/arm64 \
+            -t ${{ env.DOCKERHUB_IMAGE }}:${VER}-arm64 \
+            --build-arg DNSMGR_VERSION=${VER} \
+            --output type=docker,dest=dist/dnsmgr_${VER}_arm64.tar \
+            .
+
+          ls -lh dist
+
+      - name: 校验离线包存在（防止上传旧文件/空文件）
+        if: steps.need.outputs.build == 'yes'
+        run: |
+          set -e
+          VER="${{ steps.upstream.outputs.version }}"
+          test -f "dist/dnsmgr_${VER}_amd64.tar"
+          test -f "dist/dnsmgr_${VER}_arm64.tar"
+          ls -lh dist
+
+      # =========================
+      # Release：说明仅上游链接/镜像标签/导入命令
+      # =========================
+      - name: 生成 Release 说明内容（按模式：最新版/指定版本）
+        if: steps.need.outputs.build == 'yes'
+        id: notes
+        run: |
+          set -e
+          VER="${{ steps.upstream.outputs.version }}"
+          MODE="${{ steps.need.outputs.mode }}"
+
+          UPSTREAM_URL="https://github.com/${{ env.UPSTREAM_REPO }}/releases/tag/${VER}"
+
+          if [ "${MODE}" = "latest" ]; then
+            DOCKER_TAGS_DH="- \`${{ env.DOCKERHUB_IMAGE }}:latest\`
+- \`${{ env.DOCKERHUB_IMAGE }}:v${VER}\`"
+            DOCKER_TAGS_GHCR="- \`${{ env.GHCR_IMAGE }}:latest\`
+- \`${{ env.GHCR_IMAGE }}:v${VER}\`"
+          else
+            DOCKER_TAGS_DH="- \`${{ env.DOCKERHUB_IMAGE }}:v${VER}\`"
+            DOCKER_TAGS_GHCR="- \`${{ env.GHCR_IMAGE }}:v${VER}\`"
+          fi
+
+          cat > release_notes.md <<EOF
+          ## 上游 Release
+          - ${UPSTREAM_URL}
+
+          ## 镜像标签
+          **Docker Hub**
+          ${DOCKER_TAGS_DH}
+
+          **GHCR**
+          ${DOCKER_TAGS_GHCR}
+
+          ## 离线包导入
+          **amd64（x86_64）**
+          \`\`\`bash
+          docker load -i dnsmgr_${VER}_amd64.tar
+          \`\`\`
+
+          **arm64**
+          \`\`\`bash
+          docker load -i dnsmgr_${VER}_arm64.tar
+          \`\`\`
+          EOF
+
+          echo "file=release_notes.md" >> "$GITHUB_OUTPUT"
+
+      - name: 确保 Release 存在（不存在则创建/存在则更新说明）
+        if: steps.need.outputs.build == 'yes'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -e
+          VER="${{ steps.upstream.outputs.version }}"
+          TAG="v${VER}"
+
+          if gh release view "${TAG}" >/dev/null 2>&1; then
+            echo "Release ${TAG} 已存在，更新说明..."
+            gh release edit "${TAG}" --title "dnsmgr ${VER}" --notes-file "${{ steps.notes.outputs.file }}"
+          else
+            echo "Release ${TAG} 不存在，创建中..."
+            gh release create "${TAG}" \
+              --title "dnsmgr ${VER}" \
+              --notes-file "${{ steps.notes.outputs.file }}"
+          fi
+
+      # ✅ 关键：强制重构时，先删同名旧附件，再上传新 tar —— 这样 Release 离线包一定替换成强制重构产物
+      - name: 删除同名旧附件（强制重构时替换 Release 离线包）
+        if: steps.need.outputs.build == 'yes' && steps.need.outputs.rebuild == 'yes'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -e
+          VER="${{ steps.upstream.outputs.version }}"
+          TAG="v${VER}"
+
+          ASSET1="dnsmgr_${VER}_amd64.tar"
+          ASSET2="dnsmgr_${VER}_arm64.tar"
+
+          RID="$(gh api repos/${{ github.repository }}/releases/tags/${TAG} --jq .id)"
+          echo "release id: ${RID}"
+
+          for NAME in "${ASSET1}" "${ASSET2}"; do
+            AID="$(gh api repos/${{ github.repository }}/releases/${RID}/assets --jq ".[] | select(.name==\"${NAME}\") | .id" || true)"
+            if [ -n "${AID}" ]; then
+              echo "发现同名附件 ${NAME} (asset id: ${AID})，删除中..."
+              gh api -X DELETE repos/${{ github.repository }}/releases/assets/${AID}
+            else
+              echo "未发现同名附件 ${NAME}，无需删除"
+            fi
+          done
+
+      - name: 上传 tar 到 Release 附件（最新版：标记 latest）
+        if: steps.need.outputs.build == 'yes' && steps.need.outputs.release_make_latest == 'yes'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ steps.upstream.outputs.version }}
+          files: |
+            dist/dnsmgr_${{ steps.upstream.outputs.version }}_amd64.tar
+            dist/dnsmgr_${{ steps.upstream.outputs.version }}_arm64.tar
+          make_latest: true
+
+      - name: 上传 tar 到 Release 附件（指定版本：不影响 latest）
+        if: steps.need.outputs.build == 'yes' && steps.need.outputs.release_make_latest == 'no'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ steps.upstream.outputs.version }}
+          files: |
+            dist/dnsmgr_${{ steps.upstream.outputs.version }}_amd64.tar
+            dist/dnsmgr_${{ steps.upstream.outputs.version }}_arm64.tar
+          make_latest: false
+
+      # =========================
+      # 推送镜像：多架构 manifest（latest + 版本号 / 或仅版本号）
+      # =========================
+      - name: 构建并推送镜像（最新版：latest + 版本号）
+        if: steps.need.outputs.build == 'yes' && steps.need.outputs.push_latest == 'yes'
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          push: true
+          platforms: linux/amd64,linux/arm64
+          build-args: |
+            DNSMGR_VERSION=${{ steps.upstream.outputs.version }}
+          tags: |
+            ${{ env.DOCKERHUB_IMAGE }}:latest
+            ${{ env.DOCKERHUB_IMAGE }}:v${{ steps.upstream.outputs.version }}
+            ${{ env.GHCR_IMAGE }}:latest
+            ${{ env.GHCR_IMAGE }}:v${{ steps.upstream.outputs.version }}
+
+      - name: 构建并推送镜像（指定版本：仅版本号）
+        if: steps.need.outputs.build == 'yes' && steps.need.outputs.push_latest == 'no'
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          push: true
+          platforms: linux/amd64,linux/arm64
+          build-args: |
+            DNSMGR_VERSION=${{ steps.upstream.outputs.version }}
+          tags: |
+            ${{ env.DOCKERHUB_IMAGE }}:v${{ steps.upstream.outputs.version }}
+            ${{ env.GHCR_IMAGE }}:v${{ steps.upstream.outputs.version }}
