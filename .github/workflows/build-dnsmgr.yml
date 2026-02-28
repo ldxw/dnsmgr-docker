@@ -22,8 +22,7 @@ on:
         default: false
 
   schedule:
-    # 每天北京时间 00:10 触发（UTC=16:10）
-    - cron: "10 16 * * *"
+    - cron: "10 16 * * *" # 北京时间 00:10（UTC 16:10）
 
 permissions:
   contents: write
@@ -49,7 +48,7 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          set -e
+          set -euo pipefail
 
           INPUT_VER="${{ github.event.inputs.build_version }}"
           if [ -n "${INPUT_VER}" ]; then
@@ -57,20 +56,20 @@ jobs:
             VER="${TAG#v}"
             echo "使用手动指定版本：${TAG} -> ${VER}"
           else
-            TAG="$(gh api repos/${UPSTREAM_REPO}/releases/latest --jq .tag_name)"  # 可能是 2.15 或 v2.15
-            VER="${TAG#v}"  # 去掉前缀 v（如果没有 v 也不影响）
+            TAG="$(gh api repos/${UPSTREAM_REPO}/releases/latest --jq .tag_name)"
+            VER="${TAG#v}"
             echo "使用上游最新版本：${TAG} -> ${VER}"
           fi
 
           echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
           echo "version=${VER}" >> "$GITHUB_OUTPUT"
 
-      - name: 读取本仓库已构建的版本号（用于对比，仅最新版模式需要）
+      - name: 读取本仓库已构建的版本号（仅最新版模式需要）
         id: local
         run: |
-          set -e
+          set -euo pipefail
           if [ -f "${VERSION_FILE}" ]; then
-            CUR="$(cat "${VERSION_FILE}" | tr -d ' \n\r\t')"
+            CUR="$(tr -d ' \n\r\t' < "${VERSION_FILE}")"
           else
             CUR=""
           fi
@@ -82,7 +81,7 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          set -e
+          set -euo pipefail
 
           EVENT="${{ github.event_name }}"
           FORCE_LATEST="${{ github.event.inputs.force_rebuild }}"
@@ -92,6 +91,17 @@ jobs:
           VER="${{ steps.upstream.outputs.version }}"
           TAG="v${VER}"
 
+          # 默认输出（避免后续引用空值）
+          {
+            echo "build=no"
+            echo "mode=latest"
+            echo "push_latest=yes"
+            echo "release_make_latest=yes"
+            echo "update_version_file=yes"
+            echo "rebuild=no"
+            echo "tag=${TAG}"
+          } >> "$GITHUB_OUTPUT"
+
           echo "event_name=${EVENT}"
           echo "force_rebuild(latest)=${FORCE_LATEST}"
           echo "build_version=${INPUT_VER}"
@@ -99,31 +109,26 @@ jobs:
           echo "resolved_version=${VER}"
           echo "resolved_tag=${TAG}"
 
-          # 默认输出（避免后面引用为空）
-          echo "build=no" >> "$GITHUB_OUTPUT"
-          echo "mode=latest" >> "$GITHUB_OUTPUT"
-          echo "push_latest=yes" >> "$GITHUB_OUTPUT"
-          echo "release_make_latest=yes" >> "$GITHUB_OUTPUT"
-          echo "update_version_file=yes" >> "$GITHUB_OUTPUT"
-          echo "rebuild=no" >> "$GITHUB_OUTPUT"
-          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
-
-          # ---------- 模式：手动指定版本（旧版/任意版本） ----------
+          # -------- 手动指定版本（旧版/任意版本） --------
           if [ "${EVENT}" = "workflow_dispatch" ] && [ -n "${INPUT_VER}" ]; then
-            echo "mode=manual_version" >> "$GITHUB_OUTPUT"
-            echo "push_latest=no" >> "$GITHUB_OUTPUT"
-            echo "release_make_latest=no" >> "$GITHUB_OUTPUT"
-            echo "update_version_file=no" >> "$GITHUB_OUTPUT"
+            {
+              echo "mode=manual_version"
+              echo "push_latest=no"
+              echo "release_make_latest=no"
+              echo "update_version_file=no"
+            } >> "$GITHUB_OUTPUT"
 
             # 强制重构指定版本：一定构建 + 一定替换 Release 附件
             if [ "${FORCE_VER}" = "true" ]; then
-              echo "build=yes" >> "$GITHUB_OUTPUT"
-              echo "rebuild=yes" >> "$GITHUB_OUTPUT"
+              {
+                echo "build=yes"
+                echo "rebuild=yes"
+              } >> "$GITHUB_OUTPUT"
               echo "手动指定版本：强制重构 ${VER}"
               exit 0
             fi
 
-            # 不强制：若 Release 已存在且两个附件都存在，则跳过；否则构建
+            # 不强制：如果 Release 已存在且附件齐全则跳过
             ASSET1="dnsmgr_${VER}_amd64.tar"
             ASSET2="dnsmgr_${VER}_arm64.tar"
 
@@ -132,48 +137,44 @@ jobs:
               A1="$(gh api repos/${{ github.repository }}/releases/${RID}/assets --jq ".[] | select(.name==\"${ASSET1}\") | .id" || true)"
               A2="$(gh api repos/${{ github.repository }}/releases/${RID}/assets --jq ".[] | select(.name==\"${ASSET2}\") | .id" || true)"
               if [ -n "${A1}" ] && [ -n "${A2}" ]; then
-                echo "build=no" >> "$GITHUB_OUTPUT"
-                echo "rebuild=no" >> "$GITHUB_OUTPUT"
                 echo "指定版本 ${VER} 的 Release 与附件已存在，跳过（如需重构请勾 force_rebuild_version）"
                 exit 0
               fi
             fi
 
-            echo "build=yes" >> "$GITHUB_OUTPUT"
-            echo "rebuild=no" >> "$GITHUB_OUTPUT"
-            echo "指定版本 ${VER} 未发现完整附件，开始构建"
+            {
+              echo "build=yes"
+              echo "rebuild=no"
+            } >> "$GITHUB_OUTPUT"
+            echo "指定版本 ${VER} 附件不完整/不存在，开始构建"
             exit 0
           fi
 
-          # ---------- 模式：最新版构建（定时 / 手动不指定版本） ----------
-          echo "mode=latest" >> "$GITHUB_OUTPUT"
-          echo "push_latest=yes" >> "$GITHUB_OUTPUT"
-          echo "release_make_latest=yes" >> "$GITHUB_OUTPUT"
-          echo "update_version_file=yes" >> "$GITHUB_OUTPUT"
-
-          # 手动触发且选择强制重构（最新版）
+          # -------- 最新版（定时 / 手动不指定版本） --------
           if [ "${EVENT}" = "workflow_dispatch" ] && [ "${FORCE_LATEST}" = "true" ]; then
-            echo "build=yes" >> "$GITHUB_OUTPUT"
-            echo "rebuild=yes" >> "$GITHUB_OUTPUT"
+            {
+              echo "build=yes"
+              echo "rebuild=yes"
+            } >> "$GITHUB_OUTPUT"
             echo "手动触发：强制重构最新版 ${VER}"
             exit 0
           fi
 
-          # 定时/手动（未强制）：按版本变化判断
           if [ "${{ steps.upstream.outputs.version }}" = "${{ steps.local.outputs.current }}" ]; then
-            echo "build=no" >> "$GITHUB_OUTPUT"
-            echo "rebuild=no" >> "$GITHUB_OUTPUT"
             echo "版本未变化，跳过"
-          else
-            echo "build=yes" >> "$GITHUB_OUTPUT"
-            echo "rebuild=no" >> "$GITHUB_OUTPUT"
-            echo "发现新版本 ${VER}"
+            exit 0
           fi
+
+          {
+            echo "build=yes"
+            echo "rebuild=no"
+          } >> "$GITHUB_OUTPUT"
+          echo "发现新版本 ${VER}"
 
       - name: 更新版本记录文件并提交（仅最新版构建）
         if: steps.need.outputs.build == 'yes' && steps.need.outputs.update_version_file == 'yes'
         run: |
-          set -e
+          set -euo pipefail
           echo "${{ steps.upstream.outputs.version }}" > "${VERSION_FILE}"
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
@@ -204,13 +205,10 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      # =========================
-      # 分别导出 amd64/arm64 tar 离线包
-      # =========================
       - name: 生成离线 tar 包（amd64 + arm64）
         if: steps.need.outputs.build == 'yes'
         run: |
-          set -e
+          set -euo pipefail
           VER="${{ steps.upstream.outputs.version }}"
           mkdir -p dist
 
@@ -230,48 +228,51 @@ jobs:
 
           ls -lh dist
 
-      - name: 校验离线包存在（防止上传旧文件/空文件）
+      - name: 校验离线包存在
         if: steps.need.outputs.build == 'yes'
         run: |
-          set -e
+          set -euo pipefail
           VER="${{ steps.upstream.outputs.version }}"
           test -f "dist/dnsmgr_${VER}_amd64.tar"
           test -f "dist/dnsmgr_${VER}_arm64.tar"
-          ls -lh dist
 
-      # =========================
-      # Release：说明仅上游链接/镜像标签/导入命令
-      # =========================
       - name: 生成 Release 说明内容（按模式：最新版/指定版本）
         if: steps.need.outputs.build == 'yes'
         id: notes
         run: |
-          set -e
+          set -euo pipefail
           VER="${{ steps.upstream.outputs.version }}"
           MODE="${{ steps.need.outputs.mode }}"
-
           UPSTREAM_URL="https://github.com/${{ env.UPSTREAM_REPO }}/releases/tag/${VER}"
-
-          if [ "${MODE}" = "latest" ]; then
-            DOCKER_TAGS_DH="- \`${{ env.DOCKERHUB_IMAGE }}:latest\`
-- \`${{ env.DOCKERHUB_IMAGE }}:v${VER}\`"
-            DOCKER_TAGS_GHCR="- \`${{ env.GHCR_IMAGE }}:latest\`
-- \`${{ env.GHCR_IMAGE }}:v${VER}\`"
-          else
-            DOCKER_TAGS_DH="- \`${{ env.DOCKERHUB_IMAGE }}:v${VER}\`"
-            DOCKER_TAGS_GHCR="- \`${{ env.GHCR_IMAGE }}:v${VER}\`"
-          fi
 
           cat > release_notes.md <<EOF
           ## 上游 Release
           - ${UPSTREAM_URL}
 
           ## 镜像标签
+          EOF
+
+          if [ "${MODE}" = "latest" ]; then
+            cat >> release_notes.md <<EOF
           **Docker Hub**
-          ${DOCKER_TAGS_DH}
+          - \`${{ env.DOCKERHUB_IMAGE }}:latest\`
+          - \`${{ env.DOCKERHUB_IMAGE }}:v${VER}\`
 
           **GHCR**
-          ${DOCKER_TAGS_GHCR}
+          - \`${{ env.GHCR_IMAGE }}:latest\`
+          - \`${{ env.GHCR_IMAGE }}:v${VER}\`
+          EOF
+          else
+            cat >> release_notes.md <<EOF
+          **Docker Hub**
+          - \`${{ env.DOCKERHUB_IMAGE }}:v${VER}\`
+
+          **GHCR**
+          - \`${{ env.GHCR_IMAGE }}:v${VER}\`
+          EOF
+          fi
+
+          cat >> release_notes.md <<EOF
 
           ## 离线包导入
           **amd64（x86_64）**
@@ -292,43 +293,34 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          set -e
+          set -euo pipefail
           VER="${{ steps.upstream.outputs.version }}"
           TAG="v${VER}"
 
           if gh release view "${TAG}" >/dev/null 2>&1; then
-            echo "Release ${TAG} 已存在，更新说明..."
             gh release edit "${TAG}" --title "dnsmgr ${VER}" --notes-file "${{ steps.notes.outputs.file }}"
           else
-            echo "Release ${TAG} 不存在，创建中..."
-            gh release create "${TAG}" \
-              --title "dnsmgr ${VER}" \
-              --notes-file "${{ steps.notes.outputs.file }}"
+            gh release create "${TAG}" --title "dnsmgr ${VER}" --notes-file "${{ steps.notes.outputs.file }}"
           fi
 
-      # ✅ 关键：强制重构时，先删同名旧附件，再上传新 tar —— 这样 Release 离线包一定替换成强制重构产物
       - name: 删除同名旧附件（强制重构时替换 Release 离线包）
         if: steps.need.outputs.build == 'yes' && steps.need.outputs.rebuild == 'yes'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          set -e
+          set -euo pipefail
           VER="${{ steps.upstream.outputs.version }}"
           TAG="v${VER}"
-
           ASSET1="dnsmgr_${VER}_amd64.tar"
           ASSET2="dnsmgr_${VER}_arm64.tar"
 
           RID="$(gh api repos/${{ github.repository }}/releases/tags/${TAG} --jq .id)"
-          echo "release id: ${RID}"
 
           for NAME in "${ASSET1}" "${ASSET2}"; do
             AID="$(gh api repos/${{ github.repository }}/releases/${RID}/assets --jq ".[] | select(.name==\"${NAME}\") | .id" || true)"
             if [ -n "${AID}" ]; then
-              echo "发现同名附件 ${NAME} (asset id: ${AID})，删除中..."
               gh api -X DELETE repos/${{ github.repository }}/releases/assets/${AID}
-            else
-              echo "未发现同名附件 ${NAME}，无需删除"
+              echo "已删除旧附件：${NAME}"
             fi
           done
 
@@ -352,9 +344,6 @@ jobs:
             dist/dnsmgr_${{ steps.upstream.outputs.version }}_arm64.tar
           make_latest: false
 
-      # =========================
-      # 推送镜像：多架构 manifest（latest + 版本号 / 或仅版本号）
-      # =========================
       - name: 构建并推送镜像（最新版：latest + 版本号）
         if: steps.need.outputs.build == 'yes' && steps.need.outputs.push_latest == 'yes'
         uses: docker/build-push-action@v6
