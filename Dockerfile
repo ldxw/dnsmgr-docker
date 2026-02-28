@@ -64,17 +64,17 @@ RUN set -eux; \
   wget -O /tmp/www.zip "https://github.com/netcccyun/dnsmgr/releases/download/${DNSMGR_VERSION}/dnsmgr_${DNSMGR_VERSION}.zip"; \
   unzip -q /tmp/www.zip -d /tmp/dnsmgr_unpack; \
   rm -f /tmp/www.zip; \
-  rm -rf /app/www; \
-  mkdir -p /app/www; \
-  cp -a /tmp/dnsmgr_unpack/. /app/www; \
+  rm -rf /usr/src/www; \
+  mkdir -p /usr/src/www; \
+  cp -a /tmp/dnsmgr_unpack/. /usr/src/www; \
   rm -rf /tmp/dnsmgr_unpack
 
 # Install composer
 RUN wget https://mirrors.aliyun.com/composer/composer.phar -O /usr/local/bin/composer && chmod +x /usr/local/bin/composer
 
-RUN composer install -d /app/www --no-dev
+RUN composer install -d /usr/src/www --no-dev
 
-RUN adduser -D -s /sbin/nologin -g www www && chown -R www.www /app/www /var/lib/nginx /var/log/nginx
+RUN adduser -D -s /sbin/nologin -g www www && chown -R www.www /usr/src/www /var/lib/nginx /var/log/nginx
 
 # crontab
 RUN echo "* * * * * cd /app/www && /usr/bin/php82 think certtask" | crontab -u www -
