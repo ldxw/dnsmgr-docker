@@ -48,7 +48,7 @@ RUN rm -rf /var/cache/apk/* /tmp/*
 COPY config/nginx.conf /etc/nginx/nginx.conf
 
 # Configure PHP-FPM
-ENV PHP_INI_DIR /etc/php82
+ENV PHP_INI_DIR=/etc/php82
 COPY config/fpm-pool.conf ${PHP_INI_DIR}/php-fpm.d/www.conf
 COPY config/php.ini ${PHP_INI_DIR}/conf.d/custom.ini
 
